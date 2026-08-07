@@ -26,7 +26,13 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest -q
+        run: |
+          set +e
+          pytest -q
+          code=$?
+          set -e
+          if [ $code -eq 5 ]; then echo "No tests collected yet - passing scaffold."; exit 0; fi
+          exit $code
 
   terraform:
     runs-on: ubuntu-latest
@@ -40,9 +46,9 @@ jobs:
 
       - name: Validate
         run: |
-          if [ -d infra ]; then
+          if [ -d infra ] && ls infra/*.tf >/dev/null 2>&1; then
             terraform -chdir=infra init -backend=false
             terraform -chdir=infra validate
           else
-            echo "No infra/ directory yet - skipping validate"
+            echo "No Terraform files in infra/ yet - skipping validate."
           fi
