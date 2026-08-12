@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "7602:5432"
+    environment:
+      POSTGRES_DB: orchestrator
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.7
+    ports:
+      - "7604:9324"
+    volumes:
+      - ./elasticmq.conf:/opt/elasticmq.conf
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9324/ || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  # LocalStack (SNS) — optional, only needed for outbox relay testing
+  # Uncomment if you want to test SNS publishing locally:
+  # localstack:
+  #   image: localstack/localstack:3.8
+  #   ports:
+  #     - "7608:4566"
+  #   environment:
+  #     SERVICES: sns,sqs
+  #     DEFAULT_REGION: us-east-1
+
+  # Jaeger — optional, only needed for tracing visualization
+  # Uncomment if you want to view traces:
+  # jaeger:
+  #   image: jaegertracing/all-in-one:1.54
+  #   ports:
+  #     - "7606:16686"
+  #     - "7607:4317"
+  #   environment:
+  #     COLLECTOR_OTLP_ENABLED: "true"
+
+volumes:
+  pgdata:
