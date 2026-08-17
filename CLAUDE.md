@@ -120,3 +120,31 @@ Milestones per `SPEC.md` §10. CI green on push; `terraform fmt`/`validate` in C
 Report honestly, with the conditions attached: "2 400 sessions held 12 min across 2 Fargate tasks, 0 seq
 gaps, 118 reconnects all replayed clean, delivery lag p95 41 ms, ulimit 65536" is the deliverable. "Handles
 thousands of connections" is not.
+
+---
+
+## Extended stack additions (2026-08-17)
+
+See `SPEC.md` §12–13. Gains: **AWS SNS** with a transactional outbox, a **TypeScript client SDK**,
+**OpenTelemetry**. Deliberately little else — the claim is about *not dropping connections*, and every extra
+moving part is another thing that can drop one. Restraint here is the engineering call; say so in the README.
+
+**New ports** (same 7600–7699 block): `7606` Jaeger UI · `7607` OTel Collector gRPC · `7608` LocalStack SNS.
+
+**New prerequisites:** `opentelemetry-sdk` + FastAPI/asyncpg/boto3 instrumentation. For the SDK: a `sdk/`
+workspace with `tsup` or `tsc` build, `vitest`, and type generation from the server's event schemas.
+
+**New hard rules:**
+
+10. **SNS publishes only after the terminal-state transaction commits** — via a transactional outbox with a
+    relay, never a `publish()` inside or beside the transaction. A rolled-back transaction that already
+    announced success is the classic dual-write bug, and there must be a test for it.
+11. **The SDK asserts gap-free delivery and throws on an unfillable gap.** A client that silently continues
+    past a gap makes the headline claim unverifiable from the consumer side, which defeats the purpose.
+12. **`web/` consumes the SDK**, not its own WebSocket code. That's also how the SDK gets tested properly.
+13. **Event types are generated from the server schemas**, never hand-maintained. Hand-written duplicates
+    drift, and a drifted event union is a runtime failure in a typed client.
+14. **Trace context propagates through SQS message attributes**, so worker spans attach to the API request's
+    trace. Retries use **span links**, not fresh root traces.
+15. **Tracing is sampled, and exporters are off for the headline load run.** At the target session count,
+    tracing every event is more telemetry than payload. Record the measured overhead.

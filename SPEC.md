@@ -294,3 +294,82 @@ measurement pick the number.
 | **without dropped connections** | ☐ | 0 sequence gaps under churn, with the §1 definition published |
 
 Any unchecked row ⇒ `Bravim_Purohit_Backend_Engineer.tex:134` stays commented and `[N]` stays bracketed.
+
+---
+
+## 12. Extended stack (added 2026-08-17)
+
+This project also gains relatively little, and for a good reason: its claim is about **not dropping
+connections under load**, and every additional moving part is another thing that can drop one. Restraint
+here is the correct engineering call, and the README should say so.
+
+### 12.1 AWS SNS for terminal-state fan-out
+
+SQS buffers work *into* the system. SNS publishes results *out* of it — a different job, and worth showing
+you know the difference rather than reusing one queue for both.
+
+On a run reaching a terminal state, publish to an SNS topic with message attributes (`workflow`, `state`,
+`run_id`) so subscribers filter server-side. Subscribers: an SQS queue for durable downstream processing,
+and optionally a webhook endpoint.
+
+Requirements: publish **after** the terminal-state transaction commits, never inside it (a rolled-back
+transaction must not have announced success — the classic dual-write bug). Use the transactional-outbox
+pattern: write an outbox row in the same transaction, then a relay publishes and marks it sent. That makes
+this a legitimate distributed-systems artefact rather than a `publish()` call.
+
+### 12.2 TypeScript client SDK
+
+A publishable npm package, and the most under-rated deliverable on this list — reconnect-with-replay is
+subtle enough that hand-rolling it per consumer guarantees bugs, so putting it in a typed client is what a
+real platform team would do.
+
+```ts
+const run = await client.runs.create({ workflow: "research", input });
+for await (const ev of client.runs.stream(run.id, { resumeFrom: lastSeq })) { … }
+```
+
+Requirements: tracks `last_seq` internally; automatic reconnect with jittered backoff; **asserts gap-free
+delivery and throws on an unfillable gap** rather than silently continuing; exposes a `resumeFrom` token the
+caller can persist; typed event union matching the server's closed `kind` enum; works in Node 22 and the
+browser. Generate the event types from the server's schemas so they cannot drift.
+
+The `web/` console consumes this SDK rather than its own WebSocket code — which is also how the SDK gets
+tested properly.
+
+### 12.3 OpenTelemetry
+
+The highest-value addition here, because a run's life crosses four boundaries — API → SQS → worker →
+Postgres → WebSocket → client — and without context propagation each is a separate mystery.
+
+- Propagate trace context **through the SQS message attributes**, so a worker's spans attach to the trace of
+  the API request that created the run. Same for the outbox → SNS hop.
+- Spans: `submit`, `enqueue`, `receive`, `step_execute`, `checkpoint_write`, `event_append`, `notify`,
+  `ws_deliver`. One parent span per run, with **span links** from each retry to the previous attempt so a
+  resumed run reads as one story rather than several.
+- Metrics via the OTel SDK to Prometheus: live socket count, delivery lag, gap count, reconnects, visibility
+  extensions issued, checkpoint write latency, queue depth.
+- **Per-connection tracing must be sampleable.** At the target session count, tracing every event is more
+  telemetry than payload; use head sampling with a fixed low rate, and turn exporters off entirely for the
+  headline load run. Record the overhead you measured.
+
+The delivery-lag histogram from these metrics is what the load panel renders, and `ws_deliver` spans are
+what let you prove a lag spike came from Postgres and not the socket layer.
+
+## 13. Additional milestones
+
+- **M7 SDK.** TypeScript client with reconnect-and-replay, gap assertion, generated event types; `web/`
+  refactored to consume it; published to npm or GitHub Packages; used by the load harness as a second
+  consumer.
+- **M8 Outbox + SNS.** Transactional outbox with a relay; SNS topic with attribute filtering; an SQS
+  subscriber; a test proving no publish occurs for a rolled-back transaction.
+- **M9 Observability.** OTel with context propagated through SQS; span links across retries; sampling
+  strategy documented; overhead measured; exporters confirmed off for the headline load run.
+
+### Honest-claims additions
+
+| Claim | Status | Backed by |
+| --- | --- | --- |
+| clients can consume the stream safely | ☐ | typed SDK asserting gap-free delivery, used by console + harness |
+| no dual-write bug on completion | ☐ | outbox test: rolled-back transaction publishes nothing |
+| traceable across service boundaries | ☐ | one trace spanning API → SQS → worker → WS |
+| telemetry didn't inflate the result | ☐ | measured overhead; exporters off for the reported run |
