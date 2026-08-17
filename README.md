@@ -113,6 +113,18 @@ bench/         connection load generator
 docs/STUDY.md  notes from khoj and langgraph
 ```
 
+## Documents
+
+| File | What it's for |
+| --- | --- |
+| [SPEC.md](SPEC.md) | **Authoritative** technical specification — what to build, the data model, the measurement protocol, and the honest-claims register |
+| [ROADMAP.md](ROADMAP.md) | Build order, milestone by milestone |
+| [CLAUDE.md](CLAUDE.md) | Operating rules for a coding session here: environment, ports, conventions, when to stop and ask |
+| [docs/STUDY.md](docs/STUDY.md) | What to read in the reference implementations before writing code |
+
+Where `SPEC.md` and any other document disagree, `SPEC.md` wins.
+
 ## Status
 
-Scaffold. See [ROADMAP.md](ROADMAP.md) and [docs/STUDY.md](docs/STUDY.md).
+Scaffold — specified, not yet implemented. This repo reserves ports **7600–7699**; up to eight sibling
+projects may run at the same time, so nothing here binds outside that block.
