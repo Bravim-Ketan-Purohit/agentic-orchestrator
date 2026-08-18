@@ -10,6 +10,7 @@
 !.env.example
 *.pem
 secrets/
+web/.env.local
 
 # --- Logs ---
 *.log

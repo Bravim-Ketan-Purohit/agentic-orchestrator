@@ -5,12 +5,13 @@ import { BackendStatus } from "@/components/backend-status";
 import { ArchitectureView } from "@/components/architecture-view";
 import { SimulationDemo } from "@/components/simulation-demo";
 import { LiveDemo } from "@/components/live-demo";
+import { ChatDemo } from "@/components/chat-demo";
 import { SystemClaims } from "@/components/system-claims";
 
-type Tab = "simulation" | "live" | "architecture" | "claims";
+type Tab = "chat" | "simulation" | "live" | "architecture" | "claims";
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<Tab>("simulation");
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [backendConnected, setBackendConnected] = useState(false);
 
   return (
@@ -43,6 +44,16 @@ export default function Home() {
       {/* Tab navigation */}
       <nav className="flex gap-2 mb-6 border-b border-border pb-2 flex-wrap">
         <button
+          onClick={() => setActiveTab("chat")}
+          className={`px-4 py-2 rounded-t text-sm transition-colors ${
+            activeTab === "chat"
+              ? "bg-primary text-primary-foreground font-medium"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Live Chat Demo
+        </button>
+        <button
           onClick={() => setActiveTab("simulation")}
           className={`px-4 py-2 rounded-t text-sm transition-colors ${
             activeTab === "simulation"
@@ -50,7 +61,7 @@ export default function Home() {
               : "text-muted-foreground hover:text-foreground"
           }`}
         >
-          Simulation Demo
+          Crash Recovery
         </button>
         <button
           onClick={() => setActiveTab("live")}
@@ -87,6 +98,7 @@ export default function Home() {
         </button>
       </nav>
 
+      {activeTab === "chat" && <ChatDemo />}
       {activeTab === "simulation" && <SimulationDemo />}
       {activeTab === "live" && (
         backendConnected ? (
