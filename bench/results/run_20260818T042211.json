@@ -1,0 +1,15 @@
+{
+  "sessions_sustained": 125,
+  "total_events": 1798,
+  "total_gaps": 0,
+  "total_reconnects": 512,
+  "total_reconnect_failures": 155,
+  "total_server_closes": 357,
+  "delivery_lag_p50_ms": 62.281000000000006,
+  "delivery_lag_p95_ms": 26895.014,
+  "delivery_lag_p99_ms": 32171.253999999997,
+  "hold_duration_seconds": 40,
+  "ulimit": 65536,
+  "topology": "1 API instance at http://localhost:7601",
+  "timestamp": "20260818T042211"
+}

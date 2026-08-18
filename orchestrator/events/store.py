@@ -31,13 +31,19 @@ async def append_event(
 
     Returns the allocated seq number.
     """
-    # Lock the run row and get next seq in one shot
+    # Serialise seq allocation by locking the RUN row first. Postgres rejects
+    # FOR UPDATE on an aggregate query, so the lock and the max() must be two
+    # statements: the row lock is what prevents concurrent allocations from
+    # producing duplicate or gapped sequence numbers.
+    await session.execute(
+        text("SELECT id FROM runs WHERE id = :run_id FOR UPDATE"),
+        {"run_id": str(run_id)},
+    )
     result = await session.execute(
         text("""
             SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
             FROM events
             WHERE run_id = :run_id
-            FOR UPDATE
         """),
         {"run_id": str(run_id)},
     )

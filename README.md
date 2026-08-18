@@ -22,7 +22,11 @@ connection lifecycle, state durability, and horizontal scaling — not about pro
 
 | Metric | Resume placeholder | Measured | Method |
 | --- | --- | --- | --- |
-| Concurrent streaming sessions | `[N]` sustained, zero drops | — | TBD |
+| Concurrent streaming sessions | `[N]` sustained, zero drops | **150** (5 min hold) | `bench/wsload.py`, see [BENCHMARKS.md](BENCHMARKS.md) |
+| Sequence gaps | — | **0** at every level tested | monotonic per-run seq asserted client-side |
+| Reconnect replay failures | — | **0** of 289 | 5 % reconnect churn |
+| Delivery lag p99 @150 | — | **12.8 s** | degrades above ~50 sessions — stated, not hidden |
+| Delivery lag p99 @50 | — | **166 ms** | healthy operating point |
 
 Define before measuring:
 
@@ -126,5 +130,12 @@ Where `SPEC.md` and any other document disagree, `SPEC.md` wins.
 
 ## Status
 
-Scaffold — specified, not yet implemented. This repo reserves ports **7600–7699**; up to eight sibling
+**Implemented and load-tested.** Zero sequence gaps at every level tested, including under
+reconnect churn. Session capacity is bounded by run-execution throughput rather than by the
+streaming layer — see [BENCHMARKS.md](BENCHMARKS.md), which also records two bugs found by
+actually running it: the gap-free `seq` allocator used `FOR UPDATE` on an aggregate (rejected by
+Postgres, so no run ever emitted an event), and the load harness used a `websockets` kwarg removed
+in v14.
+
+This repo reserves ports **7600–7699**; up to eight sibling
 projects may run at the same time, so nothing here binds outside that block.

@@ -114,7 +114,7 @@ class LoadClient:
                 url = f"{self.ws_url}/ws/runs/{self.stats.run_id}?last_seq={self.stats.last_seq}"
                 extra_headers = {"Origin": "http://localhost:7600"}
 
-                async with websockets.connect(url, extra_headers=extra_headers) as ws:
+                async with websockets.connect(url, additional_headers=extra_headers) as ws:
                     self._ws = ws
                     self.stats.connected = True
 

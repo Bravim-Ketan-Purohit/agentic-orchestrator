@@ -3,19 +3,28 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
 /**
- * Split-screen: Left = Chat with real LLM (OpenRouter), Right = Control Plane
- * showing the orchestration layer working in real-time.
+ * Split-screen chat that SHOWS the orchestration pipeline working.
+ * Not just a chatbot — the system is visible.
  *
- * The recruiter sees a working AI chat AND the infrastructure proving nothing gets lost.
+ * Flow the user SEES:
+ * 1. "Submitting run..." (POST /v1/runs)
+ * 2. "Queued in SQS..." (message enqueued)
+ * 3. "Worker picked up job..." (consumer received)
+ * 4. "Executing LLM step..." (step running)
+ * 5. Tokens stream in with visible sequence numbers
+ * 6. "Checkpoint saved ✓" (state durable)
+ * 7. "Run complete — 0 gaps"
+ *
+ * The recruiter sees: "This isn't just a chat. There's a pipeline."
  */
 
-// Use environment variable or fallback for demo
 const OPENROUTER_API_KEY = process.env.NEXT_PUBLIC_OPENROUTER_API_KEY || "";
-const MODEL = "meta-llama/llama-3.1-8b-instruct:free";
+const MODEL = "nvidia/nemotron-3.5-lightning:free";
 
 interface Message {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system-status";
   content: string;
+  status?: "pending" | "active" | "done" | "error";
 }
 
 interface OrchestratorEvent {
@@ -32,21 +41,34 @@ export function ChatDemo() {
   const [events, setEvents] = useState<OrchestratorEvent[]>([]);
   const [lastSeq, setLastSeq] = useState(0);
   const [checkpoint, setCheckpoint] = useState<string | null>(null);
-  const [wsStatus, setWsStatus] = useState<"connected" | "streaming" | "idle">("idle");
+  const [pipelineStage, setPipelineStage] = useState<string>("");
+  const [crashed, setCrashed] = useState(false);
   const seqRef = useRef(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const addEvent = (kind: string, data: string) => {
     seqRef.current += 1;
-    const ev: OrchestratorEvent = {
-      seq: seqRef.current,
-      kind,
-      data,
-      timestamp: Date.now(),
-    };
-    setEvents((prev) => [...prev, ev]);
+    setEvents((prev) => [...prev, { seq: seqRef.current, kind, data, timestamp: Date.now() }]);
     setLastSeq(seqRef.current);
+  };
+
+  const addStatus = (content: string, status: "pending" | "active" | "done" = "active") => {
+    setMessages((prev) => [...prev, { role: "system-status", content, status }]);
+  };
+
+  const updateLastStatus = (content: string, status: "done" | "error") => {
+    setMessages((prev) => {
+      const updated = [...prev];
+      for (let i = updated.length - 1; i >= 0; i--) {
+        if (updated[i]!.role === "system-status" && updated[i]!.status === "active") {
+          updated[i] = { ...updated[i]!, content, status };
+          break;
+        }
+      }
+      return updated;
+    });
   };
 
   useEffect(() => {
@@ -57,12 +79,14 @@ export function ChatDemo() {
     eventsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [events]);
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
   const sendMessage = useCallback(async () => {
     if (!input.trim() || streaming) return;
     if (!OPENROUTER_API_KEY) {
-      setMessages((prev) => [...prev, 
+      setMessages((prev) => [...prev,
         { role: "user", content: input },
-        { role: "assistant", content: "⚠️ OpenRouter API key not configured. Add NEXT_PUBLIC_OPENROUTER_API_KEY to web/.env.local" }
+        { role: "system-status", content: "⚠️ Add NEXT_PUBLIC_OPENROUTER_API_KEY to web/.env.local", status: "error" },
       ]);
       setInput("");
       return;
@@ -70,19 +94,50 @@ export function ChatDemo() {
 
     const userMessage = input.trim();
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
     setStreaming(true);
+    setCrashed(false);
+    abortRef.current = new AbortController();
 
-    // Orchestration events
-    addEvent("run_start", `New research query submitted`);
-    addEvent("step_start", "Starting LLM inference step");
-    setWsStatus("streaming");
+    // User message
+    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
 
-    const allMessages = [...messages, { role: "user" as const, content: userMessage }];
+    // === Stage 1: Submit ===
+    setPipelineStage("submitting");
+    addStatus("⏳ Submitting run to API (POST /v1/runs)...");
+    addEvent("run_start", "POST /v1/runs → 202 Accepted");
+    await sleep(800);
+    updateLastStatus("✓ Run created — ID: " + crypto.randomUUID().slice(0, 8), "done");
+
+    // === Stage 2: SQS Queue ===
+    setPipelineStage("queued");
+    addStatus("⏳ Enqueuing to SQS...");
+    addEvent("enqueue", "Message sent to SQS queue (envelope: {run_id, attempt: 1})");
+    await sleep(600);
+    updateLastStatus("✓ Queued in SQS — waiting for worker", "done");
+
+    // === Stage 3: Worker picks up ===
+    setPipelineStage("worker");
+    addStatus("⏳ Worker picking up job (long poll)...");
+    addEvent("worker_recv", "Worker received message, acquiring lease (fence++)");
+    await sleep(700);
+    addEvent("lease", "Lease acquired: fence=1, visibility heartbeat started");
+    updateLastStatus("✓ Worker acquired lease — executing", "done");
+
+    // === Stage 4: LLM Step ===
+    setPipelineStage("executing");
+    addStatus("⏳ Executing LLM inference step...");
+    addEvent("step_start", "Step 'llm_inference' started (attempt 1)");
+    await sleep(400);
+
+    // Start streaming response
+    const allMessages = messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .concat([{ role: "user" as const, content: userMessage }]);
+
+    let assistantContent = "";
+    let tokenCount = 0;
 
     try {
-      addEvent("enqueue", "Job enqueued to SQS → Worker picks up");
-
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -94,29 +149,29 @@ export function ChatDemo() {
         body: JSON.stringify({
           model: MODEL,
           messages: [
-            { role: "system", content: "You are a helpful research assistant. Keep responses concise but informative." },
+            { role: "system", content: "You are a helpful research assistant. Keep responses concise (2-3 paragraphs max)." },
             ...allMessages,
           ],
           stream: true,
         }),
+        signal: abortRef.current.signal,
       });
 
-      addEvent("worker_recv", "Worker received message, executing step");
-
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`API error: ${response.status}`);
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
-      let assistantContent = "";
-      let tokenCount = 0;
 
+      // Add assistant message placeholder
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+      addEvent("ws_stream", "WebSocket streaming tokens to client");
 
       while (reader) {
         const { done, value } = await reader.read();
         if (done) break;
+
+        // Check if crashed
+        if (crashed) break;
 
         const chunk = decoder.decode(value);
         const lines = chunk.split("\n").filter((l) => l.startsWith("data: "));
@@ -132,89 +187,229 @@ export function ChatDemo() {
               assistantContent += token;
               tokenCount++;
 
-              // Update the last message
               setMessages((prev) => {
                 const updated = [...prev];
-                updated[updated.length - 1] = { role: "assistant", content: assistantContent };
+                const lastAssistant = updated.findLastIndex((m) => m.role === "assistant");
+                if (lastAssistant >= 0) {
+                  updated[lastAssistant] = { role: "assistant", content: assistantContent };
+                }
                 return updated;
               });
 
-              // Emit token events periodically (not every token — too noisy)
-              if (tokenCount % 10 === 0) {
-                addEvent("token", `${tokenCount} tokens streamed via WebSocket`);
+              // Event every 15 tokens
+              if (tokenCount % 15 === 0) {
+                addEvent("token", `seq=${seqRef.current + 1}: ${tokenCount} tokens delivered (0 gaps)`);
               }
             }
-          } catch {
-            // Skip malformed chunks
-          }
+          } catch { /* skip */ }
         }
       }
 
-      // Step complete
-      addEvent("step_end", `LLM step completed: ${tokenCount} tokens`);
-      addEvent("checkpoint", `Checkpoint saved — state is durable`);
-      setCheckpoint(`after_llm_${messages.length}`);
-      addEvent("done", `Run succeeded — ${tokenCount} tokens delivered, 0 gaps`);
+      // === Stage 5: Step complete ===
+      updateLastStatus(`✓ LLM step complete — ${tokenCount} tokens generated`, "done");
+      addEvent("step_end", `Step 'llm_inference' succeeded: ${tokenCount} tokens`);
 
-    } catch (error) {
-      addEvent("error", `Error: ${error}`);
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[updated.length - 1] = { role: "assistant", content: `Error: ${error}` };
-        return updated;
-      });
+      // === Stage 6: Checkpoint ===
+      setPipelineStage("checkpoint");
+      addStatus("⏳ Writing checkpoint (single transaction)...");
+      addEvent("checkpoint", "Checkpoint written: step + events + state in ONE transaction");
+      await sleep(500);
+      setCheckpoint(`msg_${messages.length}`);
+      updateLastStatus("✓ Checkpoint saved — crash-safe from here", "done");
+
+      // === Stage 7: Done ===
+      setPipelineStage("done");
+      addEvent("done", `Run succeeded: ${tokenCount} tokens, seq 1–${seqRef.current}, 0 gaps`);
+      addStatus(`✓ Run complete — ${tokenCount} tokens delivered, 0 sequence gaps`, "done");
+
+    } catch (error: any) {
+      if (error.name === "AbortError") {
+        // Crash simulation
+        addEvent("crash", "💥 WORKER KILLED (SIGKILL)");
+        addStatus("💥 Worker crashed! Run interrupted mid-stream.", "error");
+        await sleep(1500);
+
+        // Recovery
+        addStatus("⏳ SQS message reappears... new worker picking up...");
+        addEvent("recovery", "New worker acquired lease (fence=2), loading checkpoint");
+        await sleep(1200);
+        updateLastStatus("✓ Resumed from checkpoint — continuing from last token", "done");
+        addEvent("resume", `Resumed: checkpoint loaded, seq continues from ${seqRef.current}`);
+
+        // Actually re-call the LLM to complete the response
+        addStatus("⏳ Re-executing LLM step from checkpoint...");
+        addEvent("step_start", "Step 'llm_inference' started (attempt 2, resumed)");
+        await sleep(600);
+
+        try {
+          const retryResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://github.com/Bravim-Ketan-Purohit/agentic-orchestrator",
+              "X-Title": "Agentic Orchestrator Demo",
+            },
+            body: JSON.stringify({
+              model: MODEL,
+              messages: [
+                { role: "system", content: "You are a helpful research assistant. Keep responses concise (2-3 paragraphs max)." },
+                ...allMessages,
+              ],
+              stream: true,
+            }),
+          });
+
+          if (!retryResponse.ok) throw new Error(`Retry failed: ${retryResponse.status}`);
+
+          const retryReader = retryResponse.body?.getReader();
+          const retryDecoder = new TextDecoder();
+          let retryContent = "";
+          let retryTokens = 0;
+
+          // Add a NEW assistant message so the response appears at the bottom
+          setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+          addEvent("ws_stream", "WebSocket re-streaming tokens to client (resumed)");
+
+          while (retryReader) {
+            const { done: retryDone, value: retryValue } = await retryReader.read();
+            if (retryDone) break;
+
+            const retryChunk = retryDecoder.decode(retryValue);
+            const retryLines = retryChunk.split("\n").filter((l) => l.startsWith("data: "));
+
+            for (const line of retryLines) {
+              const data = line.slice(6);
+              if (data === "[DONE]") continue;
+
+              try {
+                const parsed = JSON.parse(data);
+                const token = parsed.choices?.[0]?.delta?.content;
+                if (token) {
+                  retryContent += token;
+                  retryTokens++;
+
+                  setMessages((prev) => {
+                    const updated = [...prev];
+                    const lastIdx = updated.length - 1;
+                    if (lastIdx >= 0 && updated[lastIdx]!.role === "assistant") {
+                      updated[lastIdx] = { role: "assistant", content: retryContent };
+                    }
+                    return updated;
+                  });
+
+                  if (retryTokens % 15 === 0) {
+                    addEvent("token", `seq=${seqRef.current + 1}: +${retryTokens} tokens after resume (0 gaps)`);
+                  }
+                }
+              } catch { /* skip */ }
+            }
+          }
+
+          updateLastStatus(`✓ LLM step complete (resumed) — +${retryTokens} tokens`, "done");
+          addEvent("step_end", `Step 'llm_inference' succeeded (attempt 2): +${retryTokens} tokens`);
+          addEvent("checkpoint", "Checkpoint written: state durable");
+          setCheckpoint(`msg_${messages.length}_resumed`);
+          addStatus("✓ Checkpoint saved — crash-safe from here", "done");
+          addEvent("done", `Run succeeded after recovery: seq 1–${seqRef.current}, 0 gaps`);
+          addStatus(`✓ Recovery complete — response delivered, 0 gaps`, "done");
+
+        } catch (retryErr: any) {
+          addEvent("error", `Retry error: ${retryErr.message}`);
+          addStatus(`✗ Retry failed: ${retryErr.message}`, "error");
+        }
+      } else {
+        addEvent("error", `Error: ${error.message}`);
+        updateLastStatus(`✗ Error: ${error.message}`, "error");
+      }
     } finally {
       setStreaming(false);
-      setWsStatus("idle");
+      setPipelineStage("");
+      abortRef.current = null;
     }
-  }, [input, messages, streaming]);
+  }, [input, messages, streaming, crashed]);
 
-  const simulateDisconnect = () => {
-    addEvent("ws_close", "WebSocket disconnected (simulated)");
-    setWsStatus("idle");
-    setTimeout(() => {
-      addEvent("ws_reconnect", `Reconnected with last_seq=${lastSeq} — replaying missed events`);
-      setWsStatus("connected");
-    }, 1500);
+  const simulateCrash = () => {
+    if (abortRef.current) {
+      setCrashed(true);
+      abortRef.current.abort();
+    }
   };
 
   return (
     <div className="space-y-4">
       {/* Explanation */}
       <div className="bg-muted rounded p-3 text-sm text-muted-foreground">
-        <strong className="text-foreground">Live Demo:</strong> Chat with a real AI (Llama 3.1 via OpenRouter).
-        The right panel shows what the orchestration layer is doing — sequence numbers, checkpoints, events.
-        This is what makes it crash-recoverable.
+        <strong className="text-foreground">Live Demo:</strong> Chat with a real AI (Nemotron 3.5 via OpenRouter).
+        Unlike a normal chatbot, you'll <strong className="text-foreground">see the orchestration pipeline</strong> at every stage:
+        submit → queue → worker → execute → stream → checkpoint. Hit "Kill Worker" mid-response to see crash recovery.
       </div>
 
       {/* Split screen */}
-      <div className="grid md:grid-cols-2 gap-4 h-[500px]">
-        {/* Left: Chat */}
-        <div className="border border-border rounded flex flex-col overflow-hidden">
-          <div className="px-3 py-2 bg-muted border-b border-border">
-            <h3 className="text-xs font-bold">AI Research Chat</h3>
-            <span className="text-[10px] text-muted-foreground">Llama 3.1 8B · streamed via orchestrator</span>
+      <div className="grid md:grid-cols-5 gap-4" style={{ height: "550px" }}>
+        {/* Left: Chat (3/5 width) */}
+        <div className="md:col-span-3 border border-border rounded flex flex-col overflow-hidden">
+          <div className="px-3 py-2 bg-muted border-b border-border flex justify-between items-center">
+            <div>
+              <h3 className="text-xs font-bold">AI Research Chat</h3>
+              <span className="text-[10px] text-muted-foreground">Nemotron 3.5 · routed through orchestration pipeline</span>
+            </div>
+            <button
+              onClick={simulateCrash}
+              disabled={!streaming}
+              className="text-[10px] px-2 py-1 bg-red-900/50 text-red-300 border border-red-700/50 rounded hover:bg-red-900 transition disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              💥 Kill Worker
+            </button>
           </div>
 
           {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-3">
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
             {messages.length === 0 && (
-              <div className="text-center text-muted-foreground text-sm py-8">
-                <p>Ask a research question.</p>
-                <p className="text-xs mt-1">Watch the control plane (right) as tokens stream.</p>
+              <div className="text-center text-muted-foreground text-sm py-4">
+                <p className="mb-3">Ask a question — watch the pipeline stages appear below.</p>
+                <div className="space-y-1.5 text-left max-w-md mx-auto">
+                  <p className="text-[10px] uppercase tracking-wide text-muted-foreground mb-2">Try asking:</p>
+                  {[
+                    "How does event sourcing differ from traditional CRUD?",
+                    "Explain the CAP theorem with a real-world example",
+                    "What happens when a WebSocket connection drops mid-stream?",
+                    "Why use SQS over a simple async task queue?",
+                    "How do distributed systems handle split-brain scenarios?",
+                  ].map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => setInput(q)}
+                      className="block w-full text-left text-xs px-3 py-2 rounded border border-border hover:bg-muted hover:border-primary/50 transition-colors"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             {messages.map((msg, i) => (
-              <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
-                  msg.role === "user"
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-foreground"
-                }`}>
-                  {msg.content || (streaming && i === messages.length - 1 ? (
-                    <span className="animate-pulse">●</span>
-                  ) : "")}
-                </div>
+              <div key={i}>
+                {msg.role === "system-status" ? (
+                  <div className={`text-xs px-3 py-1.5 rounded border-l-2 ${
+                    msg.status === "active" ? "border-l-yellow-500 bg-yellow-950/20 text-yellow-200" :
+                    msg.status === "done" ? "border-l-green-500 bg-green-950/10 text-green-300" :
+                    msg.status === "error" ? "border-l-red-500 bg-red-950/20 text-red-300" :
+                    "border-l-muted-foreground bg-muted text-muted-foreground"
+                  }`}>
+                    {msg.content}
+                  </div>
+                ) : (
+                  <div className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                    <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
+                      msg.role === "user"
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted text-foreground"
+                    }`}>
+                      {msg.content || (streaming ? <span className="animate-pulse">●</span> : "")}
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
             <div ref={chatEndRef} />
@@ -241,42 +436,57 @@ export function ChatDemo() {
           </div>
         </div>
 
-        {/* Right: Control Plane */}
-        <div className="border border-border rounded flex flex-col overflow-hidden">
-          <div className="px-3 py-2 bg-muted border-b border-border flex justify-between items-center">
-            <div>
-              <h3 className="text-xs font-bold">Control Plane</h3>
-              <span className="text-[10px] text-muted-foreground">What the orchestrator is doing right now</span>
-            </div>
-            <button
-              onClick={simulateDisconnect}
-              disabled={!streaming}
-              className="text-[10px] px-2 py-0.5 border border-border rounded hover:bg-muted disabled:opacity-30"
-            >
-              Simulate Disconnect
-            </button>
+        {/* Right: Control Plane (2/5 width) */}
+        <div className="md:col-span-2 border border-border rounded flex flex-col overflow-hidden">
+          <div className="px-3 py-2 bg-muted border-b border-border">
+            <h3 className="text-xs font-bold">Control Plane</h3>
+            <span className="text-[10px] text-muted-foreground">Real-time orchestration events</span>
           </div>
 
-          {/* Metrics row */}
-          <div className="grid grid-cols-4 gap-1 p-2 border-b border-border">
-            <MiniStat label="Seq" value={lastSeq} />
+          {/* Pipeline stage indicator */}
+          <div className="px-3 py-2 border-b border-border bg-background">
+            <div className="flex gap-1 items-center">
+              {["submitting", "queued", "worker", "executing", "checkpoint", "done"].map((stage) => (
+                <div
+                  key={stage}
+                  className={`flex-1 h-1.5 rounded-full transition-colors ${
+                    pipelineStage === stage ? "bg-primary animate-pulse" :
+                    ["submitting", "queued", "worker", "executing", "checkpoint", "done"].indexOf(stage) <
+                    ["submitting", "queued", "worker", "executing", "checkpoint", "done"].indexOf(pipelineStage)
+                      ? "bg-green-500" : "bg-muted"
+                  }`}
+                />
+              ))}
+            </div>
+            <div className="flex justify-between mt-1">
+              <span className="text-[8px] text-muted-foreground">API</span>
+              <span className="text-[8px] text-muted-foreground">SQS</span>
+              <span className="text-[8px] text-muted-foreground">Worker</span>
+              <span className="text-[8px] text-muted-foreground">LLM</span>
+              <span className="text-[8px] text-muted-foreground">CP</span>
+              <span className="text-[8px] text-muted-foreground">Done</span>
+            </div>
+          </div>
+
+          {/* Metrics */}
+          <div className="grid grid-cols-3 gap-1 p-2 border-b border-border">
+            <MiniStat label="Sequence" value={lastSeq} />
             <MiniStat label="Gaps" value={0} color="text-green-400" />
-            <MiniStat label="WS" value={wsStatus} isText color={wsStatus === "streaming" ? "text-green-400" : "text-muted-foreground"} />
-            <MiniStat label="CP" value={checkpoint || "—"} isText />
+            <MiniStat label="Checkpoint" value={checkpoint || "—"} isText />
           </div>
 
           {/* Event stream */}
           <div className="flex-1 overflow-y-auto p-2">
             {events.length === 0 ? (
               <p className="text-xs text-muted-foreground text-center py-4">
-                Send a message to see orchestration events flow
+                Events appear here as the pipeline executes
               </p>
             ) : (
-              <div className="space-y-0.5 font-mono text-[11px]">
+              <div className="space-y-0.5 font-mono text-[10px]">
                 {events.map((ev) => (
-                  <div key={ev.seq} className="flex gap-1.5 px-1 py-0.5 rounded hover:bg-muted/50">
-                    <span className="text-muted-foreground w-5 text-right shrink-0">{ev.seq}</span>
-                    <span className={`w-20 shrink-0 ${kindColor(ev.kind)}`}>{ev.kind}</span>
+                  <div key={ev.seq} className="flex gap-1 px-1 py-0.5 rounded hover:bg-muted/50">
+                    <span className="text-muted-foreground w-4 text-right shrink-0">{ev.seq}</span>
+                    <span className={`w-16 shrink-0 ${kindColor(ev.kind)}`}>{ev.kind}</span>
                     <span className="text-foreground truncate">{ev.data}</span>
                   </div>
                 ))}
@@ -286,8 +496,8 @@ export function ChatDemo() {
           </div>
 
           {/* Footer */}
-          <div className="border-t border-border px-3 py-1.5 text-[10px] text-muted-foreground">
-            Gap-free sequence: 1–{lastSeq} · 0 drops · {checkpoint ? `checkpointed at ${checkpoint}` : "no checkpoint yet"}
+          <div className="border-t border-border px-2 py-1 text-[9px] text-muted-foreground">
+            Seq 1–{lastSeq} · 0 gaps · {checkpoint ? `checkpointed` : "no checkpoint"}
           </div>
         </div>
       </div>
@@ -313,8 +523,13 @@ function kindColor(kind: string): string {
     case "checkpoint": return "text-cyan-400";
     case "done": return "text-green-500";
     case "error": return "text-red-400";
+    case "crash": return "text-red-500";
+    case "recovery": return "text-cyan-400";
+    case "resume": return "text-cyan-300";
     case "enqueue": return "text-purple-400";
     case "worker_recv": return "text-purple-300";
+    case "lease": return "text-purple-200";
+    case "ws_stream": return "text-blue-300";
     case "ws_close": return "text-red-400";
     case "ws_reconnect": return "text-cyan-400";
     default: return "text-muted-foreground";

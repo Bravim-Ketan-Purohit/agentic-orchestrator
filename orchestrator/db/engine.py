@@ -13,8 +13,8 @@ from orchestrator.config import settings
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    pool_size=20,
-    max_overflow=10,
+    pool_size=60,
+    max_overflow=40,
     pool_pre_ping=True,
 )
 
